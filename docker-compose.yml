@@ -1,0 +1,13 @@
+version: "3.0"
+services:
+  uf:
+    hostname: "splunk-uf-{{.Task.Slot}}"
+    environment:
+      - SPLUNK_SERVER=theserver
+    build: .
+    image: docker-splunk-forwarder
+    volumes:
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /data/splunk/var:/splunk/var
+    deploy:
+       mode: global

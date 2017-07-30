@@ -1,0 +1,386 @@
+#!/usr/bin/env python3
+# vim modeline (put ":set modeline" into your ~/.vimrc)
+# vim:set expandtab ts=4 sw=4 ai ft=python:
+# pylint: disable=superfluous-parens,logging-format-interpolation
+
+"""
+Splunk docker forwarder agent wrapper.
+
+Maps container logfiles from docker engine into /log, where docker is watching.
+
+Created by Brandon Gillespie
+"""
+
+import time
+import os
+import sys
+import re
+import ujson as json
+import copy
+import logging
+import logging.config
+import traceback
+import threading
+import subprocess
+import select # forever wait
+import dictlib
+from dictlib import dig_get
+import rfx
+
+# BJG: borrowed 'follow' library, added iterator
+class Follow(object):
+    """file Follower class"""
+    def __init__(self, fname, start=False, new_file_check=60, *open_args):
+        """create file Follower instance.
+           if start is True, read from start of file.
+           new_file_check is period for file turnover check in seconds.
+           additional open_args are passed to file open()."""
+        self.fname = os.path.abspath(fname)
+        self.pos = 0
+        self.file = None
+        self.stat = None
+        self.stat_time = 0
+        self.stat_time_min = new_file_check
+        self.open_args = open_args
+        self._reopen(start)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        line = self.readline()
+        if not line:
+            raise StopIteration
+        else:
+            return line
+
+    def _reopen(self, start):
+        """internal method to (re)open underlying file"""
+        if self.file:
+            self.file.close()
+        self.file = open(self.fname, *self.open_args)
+        self.stat = os.fstat(self.file.fileno())
+        self.stat_time = time.time()
+        if start:
+            # the beginning: a very good place to start
+            self.pos = 0
+        else:
+            # skip to the end. I always do....
+            self.pos = self.stat.st_size
+
+    def _preread(self):
+        """internal method to call before attempting to read"""
+        if not self.file:
+            self._reopen(False)
+            return
+        now = time.time()
+        if now >= self.stat_time + self.stat_time_min:
+            nstat = os.stat(self.fname)
+            self.stat_time = now
+            if nstat.st_dev != self.stat.st_dev or \
+                    nstat.st_ino != self.stat.st_ino:
+                # start at top of new file
+                self._reopen(True)
+                return
+        # should clear previous EOF condition
+        self.file.seek(self.pos)
+
+    def _postread(self, result):
+        """internal method to call after attempting to read"""
+        if result:
+            self.pos = self.file.tell()
+
+    def readline(self):
+        """returns next line from the file, as a string.
+           returns empty string if no additional data currently available."""
+        self._preread()
+        result = self.file.readline()
+        self._postread(result)
+        return result
+
+    def close(self):
+        """Close the currently open file. A new read operation wil reopen."""
+        if self.file:
+            self.file.close()
+            self.file = None
+
+class DockerLogTrim(object):
+    infile = None
+    outfile = None
+    wait = None
+    error = None
+
+    def __init__(self, infile, outfile, wait=1):
+        # verify good paths
+        if not os.path.exists(infile):
+            raise AttributeError("Cannot find infile={}".format(infile))
+        out = open(outfile + "-out.log", "a")
+        err = open(outfile + "-err.log", "a")
+        out.close()
+        err.close()
+        self.error = threading.Event()
+        self.infile = infile
+        self.outfile = outfile
+        self.wait = wait
+
+    def start(self):
+        tail = Follow(self.infile, start=False)
+
+        try:
+            self._start(tail)
+        except Exception as err:
+            if self.error:
+                self.error.set()
+            print("Error in processing log, closing stream.\nERROR: {}".format(err))
+
+    def _start(self, tail):
+        with open(self.outfile + "-out.log", "a") as stdout, \
+             open(self.outfile + "-err.log", "a") as stderr:
+            streams = dictlib.Obj({
+              "stdout": {"fd": stdout, "lines": 0},
+              "stderr": {"fd": stderr, "lines": 0}
+            })
+
+            while True:
+                if self.error.isSet():
+                    return
+                for line in tail:
+                    try:
+                        dline = json.loads(line)
+                        out = streams[dline["stream"]]
+                    #    out.fd.seek(0, 2) # go to the end, only needed if multiple threads write to same output file
+                        out.fd.write(dline["log"])
+                        out.lines += 1
+                    except Exception as err:
+                        print("ERROR Processing data line ({}), line:\n{}\n".format(err, line))
+                for stream in streams:
+                    if streams[stream].lines:
+                        streams[stream].fd.flush()
+                        streams[stream].lines = 0
+                time.sleep(self.wait)
+
+def thread_log(infile, outfile):
+    log = DockerLogTrim(infile, outfile)
+    thread = threading.Thread(target=log.start)
+    thread.daemon = True
+    thread.start()
+    return log.error
+
+################################################################################
+class ContainerManager(rfx.Base):
+    """
+    Manage state of our container log info
+
+    x>>
+    """
+    cfg = None
+    known = None
+    container_base = ''
+    log_base = ''
+
+    ############################################################################
+    def __init__(self, *args, **kwargs):
+        super(ContainerManager, self).__init__(*args, **kwargs)
+        self.cfg = dict()
+        self.known = dict()
+        base = kwargs.get('base')
+        if base:
+            rfx.Base.__inherit__(self, base)
+
+        cfg = os.environ.get('AGENT_CONFIG')
+        if not cfg:
+            logging.warning("Cannot find AGENT_CONFIG in environment, aborting!")
+            abort = True
+
+        self.cfg = json.loads(cfg)
+
+        # mock data
+        if kwargs.get('test'):
+            self.container_base = './tst'
+            self.log_base = './log'
+            for path in (self.container_base, self.log_base):
+                if not os.path.exists(path):
+                    os.mkdir(path)
+        else:
+            self.container_base = self.cfg.get('docker-logs', '/docker/containers')
+            self.log_base = self.cfg.get('local-logs', '/log')
+
+        abort = False
+
+        if not self.cfg.get('poll-interval'):
+            abort = True
+            self.alarm("AGENT_CONFIG:poll-interval missing")
+
+        if not os.path.exists(self.log_base):
+            abort = True
+            self.alarm("cannot find AGENT_CONFIG:local-logs={}".format(self.log_base))
+
+        if abort:
+            time.sleep(5)
+            raise ValueError("Cannot continue!")
+
+        if self.cfg.get('debug'):
+            self.debug = self.cfg.get('debug')
+
+    ############################################################################
+    def check(self):
+        """
+        Review list of containers in self.container_base FOLDER
+        Compare to known list--reconcile
+        """
+
+        self.DEBUG('Checking for Updates')
+
+        current = os.listdir(self.container_base)
+
+        for cid in current:
+            self.DEBUG('cid=' + cid)
+            # do not iterate dictionary because it changes
+            # pylint: disable=consider-iterating-dictionary
+            if cid not in self.known.keys():
+                self.watch(cid)
+
+        # do not iterate dictionary because it changes
+        # pylint: disable=consider-iterating-dictionary
+        keys = copy.copy(list(self.known.keys()))
+        for cid in keys:
+            if cid not in current:
+                self.forget(cid)
+
+    ############################################################################
+    def forget(self, cid):
+        """
+        Remove a previously monitored container from our known list
+        and remove symlink to logfile.
+        """
+
+        data = self.known[cid]
+        logdst = data['logdst']
+        data['error'].set()
+        del self.known[cid]
+        for ftype in ["out", "err"]:
+            logdstfull = logdst + "-" + ftype + ".log"
+            if os.path.exists(logdstfull):
+                try:
+                    os.unlink(logdstfull)
+                except Exception as err: # pylint: disable=broad-except
+                    logging.error("Unable to unlink {}: {}".format(logdstfull, err))
+
+    ############################################################################
+    def watch(self, cid):
+        """
+        Add to known list of containers and create symlink for splunk
+        """
+
+        self.DEBUG('watching container ' + cid)
+        logging.warn('watching container ' + cid)
+
+        try:
+            config = None
+            for fname in ('config.json', 'config.v2.json'):
+                full = self.container_base + '/' + cid + '/' + fname
+                if os.path.exists(full):
+                    with open(full, 'r') as infile:
+                        config = json.load(infile)
+                        break
+
+            # a dead container
+            if not config:
+                #logging.error("UNABLE TO FIND config json for: " + cid + "!")
+                return
+        except: # pylint: disable=bare-except
+            logging.error("Unable to read container configuration")
+            logging.error(traceback.format_exc())
+            return
+
+        # gather container info
+        if not config.get('State', {}).get('Running'):
+            return
+        cid2 = config.get('ID', '')[:12]
+        cname = config.get('Config',{}).get('Hostname', cid2)
+        if cname == cid2:
+            cname = config.get('Name', '')
+            if cname[0] == '/':
+                cname = cname[1:]
+    
+        labels = config.get('Config', {}).get('Labels', {})
+        stack = labels.get('com.docker.stack.namespace', '')
+        if not stack:
+            stack = cname.split(".",1)[0].split("_",1)[0]
+
+        logsrc = config.get('LogPath', config.get('Config',{}).get('LogPath'))
+
+        if not stack or not logsrc:
+            return
+
+        fpath = self.log_base + "/" + stack
+        if not os.path.exists(fpath):
+            os.mkdir(fpath)
+        logdst = fpath + "/" + cname # DockerLogTrim adds .log
+
+        # if nothing to change, get out of here
+        if cid in self.known:
+            if self.known[cid]['error'].isSet():
+                self.forget(cid)
+            elif os.path.exists(logdst):
+                if self.known[cid]['logsrc'] == logsrc:
+                    return
+
+        # link container
+        try:
+            os.unlink(logdst)
+        except: # pylint: disable=bare-except
+            pass
+
+        logging.info("opening {}".format(logdst))
+        error = thread_log(logsrc, logdst)
+
+        self.known[cid] = {
+            #'service': stack,
+            'name': cname,
+            'logsrc': logsrc,
+            'logdst': logdst,
+            'error': error
+        }
+
+    ############################################################################
+    def alarm(self, msg):
+        """More than logging--let us know via slack"""
+        logging.warning(msg)
+        return
+#        self.slack.send(self.cfg.get('slack-channel'), "Splunk Container Manager: " + msg)
+
+    ############################################################################
+    def start_agent(self):
+        """Startup a running agent"""
+
+        self.check()
+        interval_stopper = rfx.set_interval(int(self.cfg.get('poll-interval'))*1000, self.check)
+
+        # start splunk and wait
+        try:
+            splunk_home = os.environ.get('SPLUNK_HOME', '/splunk')
+            if not os.path.exists(splunk_home + '/.installed'):
+                logging.info("First time splunk installation")
+                sub = subprocess.Popen(['/agent/splunk_install.sh', splunk_home])
+                sub.wait()
+            else:
+                logging.info("Re-using existing installation {}".format(splunk_home))
+                sub = subprocess.Popen([splunk_home + '/bin/splunk', 'start'])
+                sub.wait()
+        except KeyboardInterrupt:
+            interval_stopper.set()
+        except: # pylint: disable=bare-except
+            interval_stopper.set()
+            logging.error("Failure running splunk")
+            logging.error(traceback.format_exc())
+            sys.exit(1)
+
+        select.select([], [], []) # wait forever
+
+def main():
+    cm = ContainerManager()
+    cm.start_agent()
+
+if __name__ == "__main__":
+    main()
