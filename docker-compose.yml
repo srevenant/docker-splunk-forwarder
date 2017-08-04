@@ -1,13 +1,25 @@
-version: "3.0"
+version: "3.3"
 services:
   uf:
-    hostname: "splunk-uf-{{.Task.Slot}}"
+    hostname: "splunk-forwarder-1"
     environment:
-      - SPLUNK_SERVER=theserver
+#      - ROTATE_FILE_BYTES=x # where x is other than default of 10485760 (10mb)
+#      - IGNORE_CONTAINERS_RX=... # regex for container names to ignore
+#      - AGENT_CONFIG=... # comes in from Dockerfile with okay defaults
+      # this is for locally managing the splunk-forwarder API only, changing from the default of `admin:changeme`  See REDAME.
+      - SPLUNK_ADMIN_HASH=$$6$$x$$y
+      - SPLUNK_GROUP=group
+      - SPLUNK_APP_INDEX=main
+      - SPLUNK_HOST_INDEX=main
     build: .
     image: docker-splunk-forwarder
     volumes:
       - /var/lib/docker/containers:/var/lib/docker/containers:ro
-      - /data/splunk/var:/splunk/var
+      - /var/log:/host/log
+      - splunk-var:/splunk/var
+      - log-buffer:/log
     deploy:
        mode: global
+volumes:
+  log-buffer:
+  splunk-var:

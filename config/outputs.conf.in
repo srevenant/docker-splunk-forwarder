@@ -2,10 +2,12 @@
 defaultGroup = main
 compressed = false
 disabled = false
-server = $SPLUNK_SERVER:9997
+
+[tcpout:index]
+server = %{splunk-indexer}:9997
 #sslCommonNameToCheck = $SPLUNK_CERT_CN
 #sslCertPath = $SPLUNK_HOME/etc/apps/serverufapp/default/client.pem
 #sslPassword = f3d19074f5e2fa1420794b7fab5f4c62
 #sslRootCAPath = $SPLUNK_HOME/etc/apps/serverufapp/default/cacert.pem
 #sslVerifyServerCert = true
-useACK = true
+#useACK = true

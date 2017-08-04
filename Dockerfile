@@ -7,6 +7,7 @@ ARG SPLUNK_VERSION=6.6.2
 ARG SPLUNK_BUILD=4b804538c686
 ARG SPLUNK_FILE=splunkforwarder-${SPLUNK_VERSION}-${SPLUNK_BUILD}-Linux-x86_64.tgz
 
+ENV PATH="${PATH}:/splunk/bin"
 ENV SPLUNK_HOME="/splunk"
 ENV SPLUNK_SERVER=splunk
 ENV POLL_INTERVAL="60"
@@ -22,22 +23,24 @@ RUN apt-get update &&\
     curl -Lo $SPLUNK_FILE "https://www.splunk.com/bin/splunk/DownloadActivityServlet?architecture=x86_64&platform=linux&version=${SPLUNK_VERSION}&product=universalforwarder&filename=${SPLUNK_FILE}&wget=true"  &&\
     tar -C $SPLUNK_HOME --strip-components=1 -xzf $SPLUNK_FILE  &&\
     rm $SPLUNK_FILE &&\
+    # this comes in via external volume
+    rm -rf $SPLUNK_HOME/var &&\
+    $SPLUNK_HOME/bin/splunk start --accept-license --answer-yes --no-prompt &&\
+    $SPLUNK_HOME/bin/splunk stop &&\
     pip3 install -r requirements.txt &&\
     apt-get purge -y --auto-remove curl wget &&\
     rm -rf ~/.cache &&\
     rm -rf /var/lib/apt/lists/*
 
-COPY agent /agent
+COPY agent /agent/
+COPY config/* /splunk/etc/system/local/
 
-RUN tar -czf serverufapp.spl serverufapp &&\
-    rm -rf serverufapp
+# pass in --build-arg=BUILD_VERSION=xxx to bypass cache and do pkg updates
+ARG BUILD_VERSION
+RUN echo $BUILD_VERSION &&\
+    apt-get update &&\
+    apt-get upgrade &&\
+    rm -rf ~/.cache &&\
+    rm -rf /var/lib/apt/lists/*
 
-## ucomment if you want a daily rebuild/redeploy for package updates
-#ARG BUILD_VERSION
-#RUN echo $BUILD_VERSION &&\
-#    apt-get update &&\
-#    apt-get upgrade &&\
-#    rm -rf ~/.cache &&\
-#    rm -rf /var/lib/apt/lists/*
-
-ENTRYPOINT ["/agent/docker-splunk-forwarder"]
+ENTRYPOINT ["/agent/splunk-docker"]

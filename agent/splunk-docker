@@ -1,0 +1,19 @@
+#!/bin/bash
+
+rm -f $SPLUNK_HOME/var/run/splunk/*.pid # possible leftover
+
+cd $SPLUNK_HOME/etc/system/local
+
+sed -e "s/%{splunk-app-index}/$SPLUNK_APP_INDEX/g" inputs.conf.in |\
+  sed -e "s/%{splunk-host-index}/$SPLUNK_HOST_INDEX/g" > inputs.conf
+sed -e "s/%{splunk-group}/$SPLUNK_GROUP/g" outputs.conf.in |\
+  sed -e "s/%{splunk-indexer}/$SPLUNK_INDEXER/g" > outputs.conf
+
+# this is a $6$ sha-512 hash
+sed -e "s|%{splunk-admin-hash}|$SPLUNK_ADMIN_HASH|g" passwd.in\
+   > $SPLUNK_HOME/etc/passwd
+
+$SPLUNK_HOME/bin/splunk start --accept-license --answer-yes --no-prompt
+
+export PYTHONUNBUFFERED=true
+exec /agent/docker-splunk-forwarder

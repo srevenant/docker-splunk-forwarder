@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # vim modeline (put ":set modeline" into your ~/.vimrc)
 # vim:set expandtab ts=4 sw=4 ai ft=python:
-# pylint: disable=superfluous-parens,logging-format-interpolation
+# pylint: disable=superfluous-parens
 
 """
 Splunk docker forwarder agent wrapper.
@@ -15,10 +15,11 @@ import time
 import os
 import sys
 import re
+import signal
 import ujson as json
+import datetime # so we don't repeat events
+import dateutil.parser # so we don't repeat events
 import copy
-import logging
-import logging.config
 import traceback
 import threading
 import subprocess
@@ -26,6 +27,16 @@ import select # forever wait
 import dictlib
 from dictlib import dig_get
 import rfx
+
+def log(**kwargs):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    msg = ''
+    for kwarg in kwargs:
+        val = str(kwargs[kwarg])
+        if " " in val:
+            val = '"' + re.sub(r'\n', '\n\t', val.replace('"', '\\"')) + '"'
+        msg += " " + kwarg + "=" + val
+    print(str(now) + msg)
 
 # BJG: borrowed 'follow' library, added iterator
 class Follow(object):
@@ -82,6 +93,7 @@ class Follow(object):
                 # start at top of new file
                 self._reopen(True)
                 return
+
         # should clear previous EOF condition
         self.file.seek(self.pos)
 
@@ -108,20 +120,58 @@ class DockerLogTrim(object):
     infile = None
     outfile = None
     wait = None
-    error = None
+    stopper = None
+    maxsize = 10*(1024*1024) # default to 10Mb
+    streams = None
 
     def __init__(self, infile, outfile, wait=1):
         # verify good paths
         if not os.path.exists(infile):
             raise AttributeError("Cannot find infile={}".format(infile))
-        out = open(outfile + "-out.log", "a")
-        err = open(outfile + "-err.log", "a")
-        out.close()
-        err.close()
-        self.error = threading.Event()
+
+        self.stopper = threading.Event()
         self.infile = infile
         self.outfile = outfile
         self.wait = wait
+        self.streams = dictlib.Obj(
+            stdout=dictlib.Obj(fd=None, lines=0, size=0, file=outfile + ".log",
+                               last=None, prev=None),
+            stderr=dictlib.Obj(fd=None, lines=0, size=0, file=outfile + ".err",
+                               last=None, prev=None),
+        )
+        if os.environ.get("ROTATE_FILE_BYTES"):
+            self.maxsize = int(os.environ.get("ROTATE_FILE_BYTES"))
+        self._open(self.streams.stdout)
+        self._open(self.streams.stderr)
+
+    def _open(self, stream):
+        self._close(stream)
+        if os.path.exists(stream.file):
+            newfile = stream.file + ".1"
+            if os.path.exists(newfile):
+                os.unlink(newfile)
+            os.rename(stream.file, newfile)
+
+        stream.fd = open(stream.file, "a")
+        stream.size = os.path.getsize(stream.file)
+
+        log(type="new-file", name=stream.file)
+        if os.path.exists(stream.file + '.last'):
+            with open(stream.file + '.last') as infile:
+                line = infile.read().split("\f")
+                if len(line) == 3:
+                    stream.prev = dictlib.Obj(time=dateutil.parser.parse(line[1]),
+                                              log=line[2])
+                else:
+                    stream.prev = None
+            os.unlink(stream.file + ".last")
+
+    def _close(self, stream):
+        if stream.fd:
+            stream.fd.close()
+        stream.fd = None
+        stream.size = 0
+        stream.lines = 0
 
     def start(self):
         tail = Follow(self.infile, start=False)
@@ -129,42 +179,73 @@ class DockerLogTrim(object):
         try:
             self._start(tail)
         except Exception as err:
-            if self.error:
-                self.error.set()
-            print("Error in processing log, closing stream.\nERROR: {}".format(err))
+            self.stopper.set()
+            log(type="error", traceback=json.dumps(traceback.format_exc()))
 
     def _start(self, tail):
-        with open(self.outfile + "-out.log", "a") as stdout, \
-             open(self.outfile + "-err.log", "a") as stderr:
-            streams = dictlib.Obj({
-              "stdout": {"fd": stdout, "lines": 0},
-              "stderr": {"fd": stderr, "lines": 0}
-            })
-
-            while True:
-                if self.error.isSet():
-                    return
+        try:
+            # self.stopper is a threading event
+            while not self.stopper.is_set():
+                # current lines
                 for line in tail:
                     try:
                         dline = json.loads(line)
-                        out = streams[dline["stream"]]
-                    #    out.fd.seek(0, 2) # go to the end, only needed if multiple threads write to same output file
+                        out = self.streams[dline["stream"]]
+                        if out.prev:
+                            date = dateutil.parser.parse(dline['time'])
+                            # skip old data
+                            if date < out.prev.time:
+                                continue
+                            # skip exact data
+                            if dline['log'] == out.prev.log:
+                                continue
+                            out.prev = None
+
+                        out.fd.seek(0, 2) # go to the end, required if multiple writers to same file
                         out.fd.write(dline["log"])
+                        out.size += len(dline["log"])
                         out.lines += 1
+                        out.last = dline
                     except Exception as err:
-                        print("ERROR Processing data line ({}), line:\n{}\n".format(err, line))
-                for stream in streams:
-                    if streams[stream].lines:
-                        streams[stream].fd.flush()
-                        streams[stream].lines = 0
+                        log(type="error", error=err, msg="failed to process line", line=line)
+
+                # review the outputs
+                for name in self.streams:
+                    stream = self.streams[name]
+                    if stream.lines:
+                        stream.fd.flush()
+                        stream.lines = 0
+
+                        # rotate?
+                        if stream.size > self.maxsize:
+                            self._open(stream) # forces a rotation
+
                 time.sleep(self.wait)
+
+            # we are exiting
+            for name in self.streams:
+                stream = self.streams[name]
+                if not stream.last:
+                    continue
+                with open(stream.file + ".last", "w") as outf:
+                    outf.write("\f" + stream.last['time'] + "\f" + stream.last['log'])
+        except:
+            raise
+        finally:
+            for name in self.streams:
+                self._close(self.streams[name])
+
+class LogThread(threading.Thread):
+    lt_log = None
 
 def thread_log(infile, outfile):
     log = DockerLogTrim(infile, outfile)
-    thread = threading.Thread(target=log.start)
-    thread.daemon = True
+    thread = LogThread(target=log.start)
+    log.stopper = threading.Event()
+    thread.lt_log = log
+    thread.daemon = False
     thread.start()
-    return log.error
+    return log.stopper
 
 ################################################################################
 class ContainerManager(rfx.Base):
@@ -177,6 +258,8 @@ class ContainerManager(rfx.Base):
     known = None
     container_base = ''
     log_base = ''
+    ignore_rx = None
+    shutdown = False
 
     ############################################################################
     def __init__(self, *args, **kwargs):
@@ -189,8 +272,12 @@ class ContainerManager(rfx.Base):
 
         cfg = os.environ.get('AGENT_CONFIG')
         if not cfg:
-            logging.warning("Cannot find AGENT_CONFIG in environment, aborting!")
+            log(type="error", msg="Cannot find AGENT_CONFIG in environment, aborting!")
             abort = True
+
+        ignore = os.environ.get('IGNORE_CONTAINERS_RX', '')
+        if ignore:
+            self.ignore_rx = re.compile(ignore)
 
         self.cfg = json.loads(cfg)
 
@@ -256,15 +343,15 @@ class ContainerManager(rfx.Base):
 
         data = self.known[cid]
         logdst = data['logdst']
-        data['error'].set()
+        data['stopper'].set()
         del self.known[cid]
-        for ftype in ["out", "err"]:
-            logdstfull = logdst + "-" + ftype + ".log"
+        for ftype in ["log", "err"]:
+            logdstfull = logdst + "." + ftype
             if os.path.exists(logdstfull):
                 try:
                     os.unlink(logdstfull)
                 except Exception as err: # pylint: disable=broad-except
-                    logging.error("Unable to unlink {}: {}".format(logdstfull, err))
+                    log(type="error", msg="Unable to unlink", logdst=logdstfull, error=err)
 
     ############################################################################
     def watch(self, cid):
@@ -273,7 +360,6 @@ class ContainerManager(rfx.Base):
         """
 
         self.DEBUG('watching container ' + cid)
-        logging.warn('watching container ' + cid)
 
         try:
             config = None
@@ -286,11 +372,9 @@ class ContainerManager(rfx.Base):
 
             # a dead container
             if not config:
-                #logging.error("UNABLE TO FIND config json for: " + cid + "!")
                 return
         except: # pylint: disable=bare-except
-            logging.error("Unable to read container configuration")
-            logging.error(traceback.format_exc())
+            log(type="error", msg="Unable to read container configuration", traceback=traceback.format_exc())
             return
 
         # gather container info
@@ -302,6 +386,7 @@ class ContainerManager(rfx.Base):
             cname = config.get('Name', '')
             if cname[0] == '/':
                 cname = cname[1:]
+        cname = cname.split(".")[0]
     
         labels = config.get('Config', {}).get('Labels', {})
         stack = labels.get('com.docker.stack.namespace', '')
@@ -313,14 +398,21 @@ class ContainerManager(rfx.Base):
         if not stack or not logsrc:
             return
 
-        fpath = self.log_base + "/" + stack
+        # because the stack part becomes the sourcetype, strip off env info
+        # this removes -p1 as well as -p1-apz113a type defs
+        stack = re.sub(r'-[a-z]\d+(-[a-z]+[0-9]+[a-z]?)?$', '', stack)
+
+        if self.ignore_rx and self.ignore_rx.search(cname):
+            return
+
+        fpath = self.log_base + "/" + cname
         if not os.path.exists(fpath):
             os.mkdir(fpath)
-        logdst = fpath + "/" + cname # DockerLogTrim adds .log
+        logdst = fpath + "/" + stack # DockerLogTrim adds .log
 
         # if nothing to change, get out of here
         if cid in self.known:
-            if self.known[cid]['error'].isSet():
+            if self.known[cid]['stopper'].is_set():
                 self.forget(cid)
             elif os.path.exists(logdst):
                 if self.known[cid]['logsrc'] == logsrc:
@@ -332,21 +424,20 @@ class ContainerManager(rfx.Base):
         except: # pylint: disable=bare-except
             pass
 
-        logging.info("opening {}".format(logdst))
-        error = thread_log(logsrc, logdst)
+        stopper = thread_log(logsrc, logdst) # spins off a thread
 
         self.known[cid] = {
             #'service': stack,
             'name': cname,
             'logsrc': logsrc,
             'logdst': logdst,
-            'error': error
+            'stopper': stopper
         }
 
     ############################################################################
     def alarm(self, msg):
         """More than logging--let us know via slack"""
-        logging.warning(msg)
+        log(type="alarm", msg=msg)
         return
 #        self.slack.send(self.cfg.get('slack-channel'), "Splunk Container Manager: " + msg)
 
@@ -357,26 +448,20 @@ class ContainerManager(rfx.Base):
         self.check()
         interval_stopper = rfx.set_interval(int(self.cfg.get('poll-interval'))*1000, self.check)
 
-        # start splunk and wait
-        try:
-            splunk_home = os.environ.get('SPLUNK_HOME', '/splunk')
-            if not os.path.exists(splunk_home + '/.installed'):
-                logging.info("First time splunk installation")
-                sub = subprocess.Popen(['/agent/splunk_install.sh', splunk_home])
-                sub.wait()
-            else:
-                logging.info("Re-using existing installation {}".format(splunk_home))
-                sub = subprocess.Popen([splunk_home + '/bin/splunk', 'start'])
-                sub.wait()
-        except KeyboardInterrupt:
+        # catch shutdown and close files / write state
+        def sigint(signum, frame):
+            log(type="info", msg="SigINT received, shutting down...")
+            self.shutdown = True
             interval_stopper.set()
-        except: # pylint: disable=bare-except
-            interval_stopper.set()
-            logging.error("Failure running splunk")
-            logging.error(traceback.format_exc())
-            sys.exit(1)
+            for thread in threading.enumerate():
+                log(type="info", msg="Stopping", thread=str(thread))
+                if isinstance(thread, LogThread):
+                    thread.lt_log.stopper.set()
 
-        select.select([], [], []) # wait forever
+        signal.signal(signal.SIGINT, sigint)
+
+        while not self.shutdown:
+            signal.pause() # wait until we are told to quit
 
 def main():
     cm = ContainerManager()
